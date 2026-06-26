@@ -279,6 +279,41 @@ function splitMessage(text, maxLen) {
 
 
 // ============================================================
+// ON-DEMAND: Check normal emails before EOD
+// Run this manually from Apps Script whenever you want a peek
+// ============================================================
+function sendDigestNow() {
+  var props = PropertiesService.getScriptProperties();
+  var items = JSON.parse(props.getProperty("digestQueue") || "[]");
+
+  if (items.length === 0) {
+    sendTelegram("📭 No normal emails queued right now.");
+    return;
+  }
+
+  var msg = "📬 *On-Demand Digest* (" + items.length + " emails so far)\n\n";
+
+  for (var i = 0; i < items.length; i++) {
+    msg += "─────────────\n" +
+      "👤 _" + escapeMarkdown(items[i].sender) + "_\n" +
+      "📌 *" + escapeMarkdown(items[i].subject) + "*\n" +
+      "📎 " + items[i].attached + "\n" +
+      "📝 " + escapeMarkdown(items[i].summary) + "\n" +
+      "🕐 " + items[i].time + "\n";
+  }
+
+  var chunks = splitMessage(msg, 4000);
+  for (var c = 0; c < chunks.length; c++) {
+    sendTelegram(chunks[c]);
+    Utilities.sleep(500);
+  }
+
+  // NOTE: Queue is NOT cleared — the 8 PM digest will still send everything
+  Logger.log("On-demand digest sent (" + items.length + " items). Queue preserved for 8 PM.");
+}
+
+
+// ============================================================
 // TEST
 // ============================================================
 function testTelegram() {
