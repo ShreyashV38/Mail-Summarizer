@@ -4,16 +4,28 @@
 const GEMINI_API_KEY = "YOUR KEY";
 const TELEGRAM_BOT_TOKEN = "YOUR TELEGRAM BOT TOKEN";
 const TELEGRAM_CHAT_ID = "YOUR TELEGRAM CHAT ID";
+const DIGEST_HOUR = 20; // 8 PM daily digest for normal emails
 // ============================================================
 
 
 // ============================================================
-// MAIN: checkMail — runs every 1 min via trigger
+// MAIN: checkMail — runs every 5 min via trigger
 // ============================================================
 function checkMail() {
   var label = GmailApp.getUserLabelByName("Processed");
   if (!label) {
     label = GmailApp.createLabel("Processed");
+  }
+
+  // Only process emails that arrived AFTER the script was initialized
+  var props = PropertiesService.getScriptProperties();
+  var startTime = props.getProperty("startTime");
+  if (!startTime) {
+    // First run — skip all existing emails
+    Logger.log("First run detected. Marking all current unread emails as Processed.");
+    markAllExistingAsProcessed(label);
+    props.setProperty("startTime", new Date().toISOString());
+    return;
   }
 
   var threads = GmailApp.search("is:unread -label:Processed");
@@ -42,29 +54,51 @@ function checkMail() {
       Logger.log("From: " + sender);
       Logger.log("Subject: " + subject);
       Logger.log("Gemini says: " + result);
+      Logger.log("Urgent: " + isUrgent);
       Logger.log("---");
 
-      // ── Build and send Telegram message instantly ──
-      var emoji = isUrgent ? "🚨" : "📩";
-      var tag = isUrgent ? "*URGENT EMAIL*" : "*New Email*";
       var summary = result
         .replace(/URGENT\s*/i, "")
         .replace(/NORMAL\s*/i, "")
         .trim();
 
-      var msg = emoji + " " + tag + "\n\n" +
-        "👤 _" + escapeMarkdown(sender) + "_\n" +
-        "📌 *" + escapeMarkdown(subject) + "*\n" +
-        "📎 " + attachmentNames + "\n" +
-        "🕐 " + time + "\n\n" +
-        "📝 " + escapeMarkdown(summary);
+      if (isUrgent) {
+        // ── INSTANT Telegram alert ──
+        var urgentMsg = "🚨 *URGENT EMAIL*\n\n" +
+          "👤 _" + escapeMarkdown(sender) + "_\n" +
+          "📌 *" + escapeMarkdown(subject) + "*\n" +
+          "📎 " + attachmentNames + "\n" +
+          "🕐 " + time + "\n\n" +
+          "📝 " + escapeMarkdown(summary);
+        sendTelegram(urgentMsg);
+      } else {
+        // ── Queue for 8 PM daily digest ──
+        saveDigestItem({
+          sender: sender,
+          subject: subject,
+          summary: summary,
+          attached: attachmentNames,
+          time: time
+        });
+      }
 
-      sendTelegram(msg);
       Utilities.sleep(2000); // rate-limit Gemini
     }
 
     threads[i].addLabel(label);
   }
+}
+
+
+// ============================================================
+// SKIP OLD MAILS: marks all existing unread emails as Processed
+// ============================================================
+function markAllExistingAsProcessed(label) {
+  var threads = GmailApp.search("is:unread -label:Processed");
+  for (var i = 0; i < threads.length; i++) {
+    threads[i].addLabel(label);
+  }
+  Logger.log("Marked " + threads.length + " existing threads as Processed");
 }
 
 
@@ -148,22 +182,72 @@ function sendTelegram(message) {
 
 
 // ============================================================
-// SETUP: Run once to create the time-based trigger
+// DIGEST: queue normal emails and send at 8 PM
 // ============================================================
-function setupTrigger() {
-  // Remove any existing checkMail triggers
+function saveDigestItem(item) {
+  var props = PropertiesService.getScriptProperties();
+  var existing = JSON.parse(props.getProperty("digestQueue") || "[]");
+  existing.push(item);
+  props.setProperty("digestQueue", JSON.stringify(existing));
+  Logger.log("Queued normal email for digest (total: " + existing.length + ")");
+}
+
+function sendDailyDigest() {
+  var props = PropertiesService.getScriptProperties();
+  var items = JSON.parse(props.getProperty("digestQueue") || "[]");
+
+  if (items.length === 0) {
+    Logger.log("No digest items — skipping");
+    return;
+  }
+
+  var msg = "📬 *Daily Email Digest* (" + items.length + " emails)\n\n";
+
+  for (var i = 0; i < items.length; i++) {
+    msg += "─────────────\n" +
+      "👤 _" + escapeMarkdown(items[i].sender) + "_\n" +
+      "📌 *" + escapeMarkdown(items[i].subject) + "*\n" +
+      "📎 " + items[i].attached + "\n" +
+      "📝 " + escapeMarkdown(items[i].summary) + "\n" +
+      "🕐 " + items[i].time + "\n";
+  }
+
+  // Split long messages (Telegram max ~4096 chars)
+  var chunks = splitMessage(msg, 4000);
+  for (var c = 0; c < chunks.length; c++) {
+    sendTelegram(chunks[c]);
+    Utilities.sleep(500);
+  }
+
+  props.setProperty("digestQueue", "[]");
+  Logger.log("Digest sent and queue cleared");
+}
+
+
+// ============================================================
+// SETUP: Run once to create all triggers
+// ============================================================
+function setupTriggers() {
+  // Remove all existing triggers
   var triggers = ScriptApp.getProjectTriggers();
   for (var i = 0; i < triggers.length; i++) {
-    if (triggers[i].getHandlerFunction() === "checkMail") {
-      ScriptApp.deleteTrigger(triggers[i]);
-    }
+    ScriptApp.deleteTrigger(triggers[i]);
   }
-  // Run checkMail every 1 minute for near-instant delivery
+
+  // Trigger 1: checkMail every 5 minutes
   ScriptApp.newTrigger("checkMail")
     .timeBased()
-    .everyMinutes(1)
+    .everyMinutes(5)
     .create();
-  Logger.log("Trigger set: checkMail runs every 1 minute");
+
+  // Trigger 2: sendDailyDigest at 8 PM daily
+  ScriptApp.newTrigger("sendDailyDigest")
+    .timeBased()
+    .atHour(DIGEST_HOUR)
+    .everyDays(1)
+    .create();
+
+  Logger.log("Triggers set: checkMail every 5 min, digest at " + DIGEST_HOUR + ":00");
 }
 
 
@@ -179,6 +263,18 @@ function escapeMarkdown(text) {
     .replace(/>/g, "\\>").replace(/#/g, "\\#").replace(/\+/g, "\\+")
     .replace(/\-/g, "\\-").replace(/\=/g, "\\=").replace(/\|/g, "\\|")
     .replace(/\./g, "\\.").replace(/!/g, "\\!");
+}
+
+function splitMessage(text, maxLen) {
+  if (text.length <= maxLen) return [text];
+  var chunks = [];
+  while (text.length > 0) {
+    var splitAt = text.lastIndexOf("\n", maxLen);
+    if (splitAt === -1 || splitAt > maxLen) splitAt = maxLen;
+    chunks.push(text.substring(0, splitAt));
+    text = text.substring(splitAt);
+  }
+  return chunks;
 }
 
 
