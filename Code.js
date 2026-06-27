@@ -1,8 +1,9 @@
 // Config
-const GEMINI_API_KEY = "YOUR KEY";
-const TELEGRAM_BOT_TOKEN = "YOUR TELEGRAM BOT TOKEN";
-const TELEGRAM_CHAT_ID = "YOUR TELEGRAM CHAT ID";
+const GEMINI_API_KEY = "YOUR_GEMINI_API_KEY_HERE";
+const TELEGRAM_BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN_HERE";
+const TELEGRAM_CHAT_ID = "YOUR_TELEGRAM_CHAT_ID_HERE";
 const DIGEST_HOUR = 20;
+const WEBAPP_URL = "YOUR_WEBAPP_URL_HERE";
 
 // Checks unread emails every 5 min, sends urgent ones instantly, queues normal ones for 8 PM
 function checkMail() {
@@ -102,8 +103,10 @@ function summarizeMail(subject, sender, body, attachments) {
     if (data.candidates && data.candidates[0] && data.candidates[0].content) {
       return data.candidates[0].content.parts[0].text.trim();
     }
+    Logger.log("Gemini response: " + response.getContentText());
     return "NORMAL — could not classify (Gemini error)";
   } catch (e) {
+    Logger.log("Gemini error: " + e.message);
     return "NORMAL — could not classify (API error)";
   }
 }
@@ -137,7 +140,7 @@ function saveDigestItem(item) {
   props.setProperty("digestQueue", JSON.stringify(existing));
 }
 
-// Sends all queued normal emails as a digest at 8 PM
+// Sends all queued normal emails as a digest at 8 PM, then clears the queue
 function sendDailyDigest() {
   var props = PropertiesService.getScriptProperties();
   var items = JSON.parse(props.getProperty("digestQueue") || "[]");
@@ -163,6 +166,47 @@ function sendDailyDigest() {
   props.setProperty("digestQueue", "[]");
 }
 
+// Handles incoming Telegram bot commands via webhook
+function pollTelegramUpdates() {
+  var props = PropertiesService.getScriptProperties();
+  var offset = parseInt(props.getProperty("tgOffset") || "0");
+
+  var url = "https://api.telegram.org/bot" + TELEGRAM_BOT_TOKEN + "/getUpdates?timeout=0&offset=" + offset;
+  
+  try {
+    var response = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+    var data = JSON.parse(response.getContentText());
+    
+    if (!data.ok || data.result.length === 0) return;
+
+    for (var i = 0; i < data.result.length; i++) {
+      var update = data.result[i];
+      var message = update.message;
+      
+      if (message && message.text) {
+        var chatId = String(message.chat.id);
+        if (chatId === TELEGRAM_CHAT_ID) {
+          var text = message.text.split("@")[0].toLowerCase().trim();
+          
+          if (text === "/whatsup") {
+            sendDigestNow();
+          } else if (text === "/status") {
+            var queue = JSON.parse(props.getProperty("digestQueue") || "[]");
+            var startTime = props.getProperty("startTime") || "not initialized";
+            sendTelegram("Status: Active\nRunning since: " + startTime + "\nQueued: " + queue.length);
+          } else if (text === "/help") {
+            sendTelegram("Commands:\n/whatsup - Get queued emails\n/status - Check status\n/help - Show this");
+          }
+        }
+      }
+      
+      props.setProperty("tgOffset", String(update.update_id + 1));
+    }
+  } catch (e) {
+    Logger.log("Poll error: " + e.message);
+  }
+}
+
 // Sends the current digest queue on demand without clearing it
 function sendDigestNow() {
   var props = PropertiesService.getScriptProperties();
@@ -173,7 +217,7 @@ function sendDigestNow() {
     return;
   }
 
-  var msg = "On-Demand Digest — " + items.length + " email(s)\n";
+  var msg = "Queued Emails — " + items.length + " email(s)\n";
 
   for (var i = 0; i < items.length; i++) {
     msg += "\n---\n" +
@@ -200,6 +244,34 @@ function setupTriggers() {
 
   ScriptApp.newTrigger("checkMail").timeBased().everyMinutes(5).create();
   ScriptApp.newTrigger("sendDailyDigest").timeBased().atHour(DIGEST_HOUR).everyDays(1).create();
+  ScriptApp.newTrigger("pollTelegramUpdates").timeBased().everyMinutes(1).create();
+}
+
+// Registers Telegram webhook using the deployed web app URL
+function setWebhook() {
+  var url = "https://api.telegram.org/bot" + TELEGRAM_BOT_TOKEN + "/setWebhook?url=" + encodeURIComponent(WEBAPP_URL);
+  var response = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+  var result = response.getContentText();
+  Logger.log("setWebhook response: " + result);
+  sendTelegram("Webhook registered: " + result);
+}
+
+// Clears all stored data and re-marks old emails — run if old emails got processed
+function resetScript() {
+  var props = PropertiesService.getScriptProperties();
+  props.deleteAllProperties();
+
+  var label = GmailApp.getUserLabelByName("Processed");
+  if (!label) label = GmailApp.createLabel("Processed");
+
+  var threads = GmailApp.search("-label:Processed");
+  for (var i = 0; i < threads.length; i++) {
+    threads[i].addLabel(label);
+  }
+
+  props.setProperty("startTime", new Date().toISOString());
+  props.setProperty("digestQueue", "[]");
+  sendTelegram("Script reset complete. Only new emails from now will be processed.");
 }
 
 // Splits long messages to stay within Telegram's character limit
@@ -207,14 +279,25 @@ function splitMessage(text, maxLen) {
   if (text.length <= maxLen) return [text];
   var chunks = [];
   while (text.length > 0) {
+    // Ensure we don't create empty strings
+    if (text.length <= maxLen) {
+      chunks.push(text);
+      break;
+    }
     var splitAt = text.lastIndexOf("\n", maxLen);
-    if (splitAt === -1 || splitAt > maxLen) splitAt = maxLen;
+    // If no newline found, force split at maxLen
+    if (splitAt === -1 || splitAt === 0) splitAt = maxLen;
+    
     chunks.push(text.substring(0, splitAt));
     text = text.substring(splitAt);
   }
   return chunks;
 }
-
+function deleteWebhook() {
+  var url = "https://api.telegram.org/bot" + TELEGRAM_BOT_TOKEN + "/deleteWebhook";
+  var r = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+  Logger.log(r.getContentText());
+}
 // Verifies Telegram bot connection
 function testTelegram() {
   sendTelegram("MailGuard is connected.");
